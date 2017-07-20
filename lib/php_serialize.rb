@@ -36,6 +36,8 @@
 #
 # See http://www.php.net/serialize and http://www.php.net/unserialize for
 # details on the PHP side of all this.
+require 'stringio'
+
 module PHP
 # string = PHP.serialize(mixed var[, bool assoc])
 #
@@ -184,7 +186,6 @@ module PHP
 		end
 		classmap ||= {}
 
-		require 'stringio'
 		string = StringIO.new(string)
 		def string.read_until(char)
 			val = ''
