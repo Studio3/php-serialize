@@ -87,7 +87,7 @@ module PHP
 			when String, Symbol
 				s << "s:#{var.to_s.length}:\"#{var.to_s}\";"
 
-			when Fixnum # PHP doesn't have bignums
+			when Integer # PHP doesn't have bignums
 				s << "i:#{var};"
 
 			when Float
