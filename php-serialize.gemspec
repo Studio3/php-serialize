@@ -14,6 +14,5 @@ Gem::Specification.new do |spec|
 
 	It can also serialize and unserialize PHP sessions.
 	EOF
-	spec.test_file = 'test.rb'
-	spec.has_rdoc = true
+	spec.test_files = ['test.rb']
 end
