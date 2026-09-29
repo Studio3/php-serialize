@@ -33,12 +33,60 @@
 #                     - Unserialize arrays properly in assoc mode.
 #                     - Add PHP session support (thanks to TJ Vanderpoel).
 #                     - Release as tarball and gem.
+#  1.2.0 -            - unserialize() no longer instantiates classes named by
+#                       the serialized data.  An 'O:' record is only built if
+#                       its class is in classmap, or the caller passes
+#                       :on_object => :constants for the old behaviour.
+#                     - Add unserialize_data(), which rejects 'O:' records
+#                       outright; use it for untrusted input.
+#                     - Only public attribute writers are called, and only for
+#                       plain identifier attribute names.
+#                     - Malformed/truncated input raises UnserializeError
+#                       instead of returning partial data or crashing with
+#                       NoMethodError.
+#                     - Nesting is bounded (:max_depth), so a deeply nested
+#                       payload raises UnserializeError rather than
+#                       SystemStackError.
+#                     - serialize() declares string lengths in bytes, like
+#                       PHP.  unserialize() reads byte lengths, still accepts
+#                       the character lengths older releases wrote, and
+#                       returns strings in the encoding of the input rather
+#                       than as binary.
 #
 # See http://www.php.net/serialize and http://www.php.net/unserialize for
 # details on the PHP side of all this.
 require 'stringio'
 
 module PHP
+	# Raised for any malformed or disallowed serialized input.  Subclasses
+	# TypeError, which earlier releases raised for unknown types, so existing
+	# rescue clauses keep working.
+	class UnserializeError < TypeError; end
+
+	# What to do with an 'O:' object record whose class is not in the classmap.
+	#
+	#   :strict    - raise UnserializeError (default; safe for untrusted input)
+	#   :data      - return the attributes as plain data, instantiating nothing
+	#   :constants - resolve the name against the constant namespace and call
+	#                .new on it.  This is the pre-1.2 behaviour and lets the
+	#                payload choose which class is built; only use it on input
+	#                you produced yourself.
+	OBJECT_MODES = [:strict, :data, :constants].freeze
+
+	# PHP property names we are willing to turn into a setter call.  Excludes
+	# PHP's "\0Class\0prop" private/protected mangling and anything that is not
+	# a plain identifier.
+	ATTRIBUTE_NAME = /\A[A-Za-z_][A-Za-z0-9_]*\z/
+
+	# How deeply arrays and objects may nest.  Parsing is recursive, and
+	# SystemStackError is not a StandardError, so an unbounded payload would
+	# blow past the caller's rescue; overrunning this raises UnserializeError
+	# instead.  Override per call with :max_depth.
+	MAX_DEPTH = 512
+
+	# Per-call parse options, threaded through the recursive descent.
+	Options = Struct.new(:classmap, :assoc, :on_object, :max_depth)
+	private_constant :Options
 # string = PHP.serialize(mixed var[, bool assoc])
 #
 # Returns a string representing the argument in a form PHP.unserialize
@@ -53,7 +101,7 @@ module PHP
 # array will be assumed to be an associative array, and will be serialized
 # as a PHP associative array rather than a multidimensional array.
 	def PHP.serialize(var, assoc = false) # {{{
-		s = ''
+		s = String.new
 		case var
 			when Array
 				s << "a:#{var.size}:{"
@@ -85,7 +133,8 @@ module PHP
 				s << '}'
 
 			when String, Symbol
-				s << "s:#{var.to_s.length}:\"#{var.to_s}\";"
+				# PHP counts the length in bytes, not characters.
+				s << "s:#{var.to_s.bytesize}:\"#{var.to_s}\";"
 
 			when Integer # PHP doesn't have bignums
 				s << "i:#{var};"
@@ -121,7 +170,7 @@ module PHP
 # Like PHP.serialize, but only accepts a Hash or associative Array as the root
 # type.  The results are returned in PHP session format.
 	def PHP.serialize_session(var, assoc = false) # {{{
-		s = ''
+		s = String.new
 		case var
 		when Hash
 			var.each do |key,value|
@@ -147,6 +196,17 @@ module PHP
 		s
 	end # }}}
 
+# mixed = PHP.unserialize_data(string serialized, [bool assoc])
+#
+# Like PHP.unserialize, but accepts data only: any 'O:' object record in the
+# input, at any depth, raises UnserializeError instead of being turned into a
+# Ruby object.  Nothing in the input can name a class or reach a method, so
+# this is the call to use for values that came from a database, a cookie, a
+# request parameter, or anywhere else outside your own process.
+	def PHP.unserialize_data(string, assoc = false, max_depth: MAX_DEPTH) # {{{
+		PHP.unserialize(string, nil, assoc, :on_object => :strict, :max_depth => max_depth)
+	end # }}}
+
 # mixed = PHP.unserialize(string serialized, [hash classmap, [bool assoc]])
 #
 # Returns an object containing the reconstituted data from serialized.
@@ -162,68 +222,157 @@ module PHP
 # this *must* be a .capitalize()d representation.  The value is expected
 # to be the class itself; i.e. something you could call .new on.
 #
-# If it's not found in 'classmap', the current constant namespace is searched,
-# and failing that, a new Struct(classname) is generated, with the arguments
-# for .new specified in the same order PHP provided; since PHP uses hashes
-# to represent attributes, this should be the same order they're specified
-# in PHP, but this is untested.
+# If the class is not in 'classmap', the :on_object option decides what
+# happens (see OBJECT_MODES).  The default, :strict, raises UnserializeError:
+# serialized input is not allowed to pick which class gets instantiated,
+# because both the constructor and the attribute setters can have side
+# effects, and those happen before the caller ever sees the return value.
+# Pass :on_object => :data to get the attributes back as a plain Hash (or,
+# with assoc, an array of pairs), or :on_object => :constants to restore the
+# pre-1.2 constant lookup for input you trust.
 #
-# each serialized attribute is sent to the new object using the respective
-# {attribute}=() method; you'll get a NameError if the method doesn't exist.
+# Each serialized attribute is assigned with the respective {attribute}=()
+# method.  The name must be a plain identifier and the method must be a public
+# writer on the target, or UnserializeError is raised; PHP's mangled private
+# property names are always rejected.
 #
-# Array, Hash, Fixnum, Float, True/FalseClass, NilClass and String should
+# Array, Hash, Integer, Float, True/FalseClass, NilClass and String should
 # be returned identically (i.e. foo == PHP.unserialize(PHP.serialize(foo))
-# for these types); Struct should be too, provided it's in the namespace
-# Module.const_get within unserialize() can see, or you gave it the same
-# name in the Struct.new(<structname>), otherwise you should provide it in
-# classmap.
-#
-# Note: StringIO is required for unserialize(); it's loaded as needed
-	def PHP.unserialize(string, classmap = nil, assoc = false) # {{{
+# for these types); Struct should be too, provided you passed it in classmap.
+	def PHP.unserialize(string, classmap = nil, assoc = false,
+			on_object: :strict, max_depth: MAX_DEPTH) # {{{
 		if classmap == true or classmap == false
 			assoc = classmap
 			classmap = {}
 		end
 		classmap ||= {}
 
-		string = StringIO.new(string)
-		def string.read_until(char)
-			val = ''
-			while (c = self.read(1)) != char
-				val << c
-			end
-			val
+		unless OBJECT_MODES.include?(on_object)
+			raise ArgumentError, ":on_object must be one of #{OBJECT_MODES.inspect}"
 		end
+		raise ArgumentError, ':max_depth must be positive' unless max_depth > 0
 
-		if string.string =~ /^(\w+)\|/ # session_name|serialized_data
+		opts = Options.new(classmap, assoc, on_object, max_depth)
+		string = StringIO.new(string)
+
+		if string.string =~ /\A(\w+)\|/ # session_name|serialized_data
 			ret = Hash.new
 			loop do
-				if string.string[string.pos, 32] =~ /^(\w+)\|/
+				if string.string[string.pos, 32] =~ /\A(\w+)\|/
 					string.pos += $&.size
-					ret[$1] = PHP.do_unserialize(string, classmap, assoc)
+					ret[$1] = PHP.do_unserialize(string, opts, 0)
 				else
 					break
 				end
 			end
 			ret
 		else
-			PHP.do_unserialize(string, classmap, assoc)
+			PHP.do_unserialize(string, opts, 0)
 		end
-	end
+	end # }}}
 
 private
-	def PHP.do_unserialize(string, classmap, assoc)
+	# Reads until 'char', which is consumed.  Raises rather than returning a
+	# truncated value, so a chopped-off payload can't be parsed as something
+	# else.
+	def PHP.read_until(string, char) # {{{
+		val = String.new
+		while (c = string.read(1)) != char
+			raise UnserializeError, "Unexpected end of serialized data" if c.nil?
+			val << c
+		end
+		val
+	end # }}}
+
+	def PHP.read_exactly(string, length) # {{{
+		raise UnserializeError, "Negative length in serialized data" if length < 0
+		val = string.read(length)
+		if val.nil? ? length > 0 : val.bytesize < length
+			raise UnserializeError, "Unexpected end of serialized data"
+		end
+		val
+	end # }}}
+
+	def PHP.read_integer(string, terminator) # {{{
+		val = read_until(string, terminator)
+		unless val =~ /\A-?\d+\z/
+			raise UnserializeError, "Expected an integer, got #{val.inspect}"
+		end
+		val.to_i
+	end # }}}
+
+	# Returns the next 'length' bytes without consuming them.
+	def PHP.peek(string, length) # {{{
+		pos = string.pos
+		val = string.read(length)
+		string.pos = pos
+		val
+	end # }}}
+
+	# Reads the s:length:"data"; body, verifying the declared length and the
+	# closing quote and semicolon.  Values come back in the encoding of the
+	# serialized string rather than as binary.
+	def PHP.read_string(string) # {{{
+		length = read_integer(string, ':')
+		quote = read_exactly(string, 1)
+		raise UnserializeError, 'Expected an opening quote' unless quote == '"'
+		encoding = string.string.encoding
+
+		val = read_exactly(string, length)
+		if peek(string, 2) == '";'
+			read_exactly(string, 2)
+			return val.force_encoding(encoding)
+		end
+
+		# PHP declares the length in bytes.  Releases of this library before
+		# 1.2.0 declared it in characters, so multibyte values they wrote are
+		# short by one byte per continuation byte.  Extend the value until the
+		# terminator lines up and the character count matches what was
+		# declared; anything else is malformed.
+		val.force_encoding(Encoding::BINARY)
+		limit = length * 3 # most extra bytes the characters could account for
+		extra = 0
+		while extra < limit
+			c = string.read(1)
+			raise UnserializeError, 'Unexpected end of serialized data' if c.nil?
+			val << c
+			extra += 1
+			next unless peek(string, 2) == '";'
+			candidate = val.dup.force_encoding(encoding)
+			if candidate.valid_encoding? and candidate.length == length
+				read_exactly(string, 2)
+				return candidate
+			end
+		end
+		raise UnserializeError, "String of declared length #{length} is not terminated"
+	end # }}}
+
+	def PHP.do_unserialize(string, opts, depth)
+		if depth > opts.max_depth
+			raise UnserializeError, "Serialized data nests deeper than #{opts.max_depth}"
+		end
+
 		val = nil
 		# determine a type
-		type = string.read(2)[0,1]
+		type = read_exactly(string, 1)
+		unless type == 'N'
+			separator = read_exactly(string, 1)
+			raise UnserializeError, "Malformed '#{type}' record" unless separator == ':'
+		end
+
 		case type
 			when 'a' # associative array, a:length:{[index][value]...}
-				count = string.read_until('{').to_i
+				count = read_integer(string, ':')
+				raise UnserializeError, 'Negative array length' if count < 0
+				brace = read_exactly(string, 1)
+				raise UnserializeError, 'Expected {' unless brace == '{'
 				val = vals = Array.new
 				count.times do |i|
-					vals << [do_unserialize(string, classmap, assoc), do_unserialize(string, classmap, assoc)]
+					vals << [do_unserialize(string, opts, depth + 1),
+						do_unserialize(string, opts, depth + 1)]
 				end
-				string.read(1) # skip the ending }
+				closing = read_exactly(string, 1) # the ending }
+				raise UnserializeError, 'Expected }' unless closing == '}'
 
 				# now, we have an associative array, let's clean it up a bit...
 				# arrays have all numeric indexes, in order; otherwise we assume a hash
@@ -242,7 +391,7 @@ private
 						value
 					end
 				else
-					if assoc
+					if opts.assoc
 						val = vals.map {|v| v }
 					else
 						val = Hash.new
@@ -253,63 +402,123 @@ private
 				end
 
 			when 'O' # object, O:length:"class":length:{[attribute][value]...}
-				# class name (lowercase in PHP, grr)
-				len = string.read_until(':').to_i + 3 # quotes, seperator
-				klass = string.read(len)[1...-2].capitalize.intern # read it, kill useless quotes
-
-				# read the attributes
-				attrs = []
-				len = string.read_until('{').to_i
-
-				len.times do
-					attr = (do_unserialize(string, classmap, assoc))
-					attrs << [attr.intern, (attr << '=').intern, do_unserialize(string, classmap, assoc)]
-				end
-				string.read(1)
-
-				val = nil
-				# See if we need to map to a particular object
-				if classmap.has_key?(klass)
-					val = classmap[klass].new
-				elsif Struct.const_defined?(klass) # Nope; see if there's a Struct
-					classmap[klass] = val = Struct.const_get(klass)
-					val = val.new
-				else # Nope; see if there's a Constant
-					begin
-						classmap[klass] = val = Module.const_get(klass)
-
-						val = val.new
-					rescue NameError # Nope; make a new Struct
-						classmap[klass] = Struct.new(klass.to_s, *attrs.collect { |v| v[0].to_s })
-						val = val.new
-					end
-				end
-
-				attrs.each do |attr,attrassign,v|
-					val.__send__(attrassign, v)
-				end
+				val = do_unserialize_object(string, opts, depth)
 
 			when 's' # string, s:length:"data";
-				len = string.read_until(':').to_i + 3 # quotes, separator
-				val = string.read(len)[1...-2] # read it, kill useless quotes
+				val = read_string(string)
 
-			when 'i' # integer, i:123
-				val = string.read_until(';').to_i
+			when 'i' # integer, i:123;
+				val = read_integer(string, ';')
 
-			when 'd' # double (float), d:1.23
-				val = string.read_until(';').to_f
+			when 'd' # double (float), d:1.23;
+				val = read_until(string, ';')
+				unless val =~ /\A-?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?\z/ or
+						%w[NAN INF -INF].include?(val)
+					raise UnserializeError, "Expected a float, got #{val.inspect}"
+				end
+				val = case val
+					when 'NAN' then Float::NAN
+					when 'INF' then Float::INFINITY
+					when '-INF' then -Float::INFINITY
+					else val.to_f
+				end
 
 			when 'N' # NULL, N;
+				terminator = read_exactly(string, 1)
+				raise UnserializeError, "Malformed 'N' record" unless terminator == ';'
 				val = nil
 
-			when 'b' # bool, b:0 or 1
-				val = (string.read(2)[0] == ?1 ? true : false)
+			when 'b' # bool, b:0; or b:1;
+				flag = read_until(string, ';')
+				unless flag == '0' or flag == '1'
+					raise UnserializeError, "Expected a boolean, got #{flag.inspect}"
+				end
+				val = flag == '1'
 
 			else
-				raise TypeError, "Unable to unserialize type '#{type}'"
+				raise UnserializeError, "Unable to unserialize type '#{type}'"
 		end
 
 		val
+	end
+
+	# Handles the 'O:' record.  The class name comes from the input, so it is
+	# only ever used as a lookup key -- never to build a Ruby object -- unless
+	# the caller opted in via classmap or :on_object => :constants.
+	def PHP.do_unserialize_object(string, opts, depth) # {{{
+		# class name (lowercase in PHP, grr)
+		name = read_string_body_of_class_name(string)
+		klass = name.capitalize.intern
+
+		# read the attributes
+		count = read_integer(string, ':')
+		raise UnserializeError, 'Negative attribute count' if count < 0
+		brace = read_exactly(string, 1)
+		raise UnserializeError, 'Expected {' unless brace == '{'
+
+		attrs = []
+		count.times do
+			attr = do_unserialize(string, opts, depth + 1)
+			attrs << [attr, do_unserialize(string, opts, depth + 1)]
+		end
+		closing = read_exactly(string, 1)
+		raise UnserializeError, 'Expected }' unless closing == '}'
+
+		target = resolve_object_class(klass, name, opts)
+
+		if target.nil? # :data -- hand back the attributes, instantiate nothing
+			return opts.assoc ? attrs : Hash[attrs]
+		end
+
+		val = target.new
+		attrs.each do |attr,v|
+			unless attr.is_a?(String) and attr =~ ATTRIBUTE_NAME
+				raise UnserializeError,
+					"Refusing to assign attribute #{attr.inspect} of #{name.inspect}"
+			end
+			writer = "#{attr}=".intern
+			unless val.respond_to?(writer)
+				raise UnserializeError,
+					"#{target} has no public #{writer} to assign attribute #{attr.inspect}"
+			end
+			val.public_send(writer, v)
+		end
+		val
+	end # }}}
+
+	# The class name in an 'O:' record is length-prefixed like a string, but
+	# terminated by ':' rather than ';'.
+	def PHP.read_string_body_of_class_name(string) # {{{
+		length = read_integer(string, ':')
+		quote = read_exactly(string, 1)
+		raise UnserializeError, 'Expected an opening quote' unless quote == '"'
+		name = read_exactly(string, length)
+		tail = read_exactly(string, 2)
+		unless tail == '":'
+			raise UnserializeError, "Class name of declared length #{length} is not terminated"
+		end
+		name.force_encoding(string.string.encoding)
+	end # }}}
+
+	# Returns the class to instantiate, or nil to mean "return plain data".
+	def PHP.resolve_object_class(klass, name, opts) # {{{
+		classmap = opts.classmap
+		return classmap[klass] if classmap.has_key?(klass)
+
+		case opts.on_object
+		when :data
+			nil
+		when :constants
+			begin
+				classmap[klass] = Object.const_get(klass, false)
+			rescue NameError
+				raise UnserializeError, "Unable to resolve class #{name.inspect}"
+			end
+		else
+			raise UnserializeError,
+				"Refusing to instantiate class #{name.inspect} from serialized data; " \
+				"add it to classmap to allow it, or pass :on_object => :data"
+		end
 	end # }}}
 end
 

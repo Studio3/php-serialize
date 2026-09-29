@@ -19,6 +19,43 @@ which has the same semantics as PHP.serialize(), but which only supports
 Hash and associative Arrays for the root object.
 
 
+Untrusted input
+===============
+
+A PHP 'O:' record names the class to build and the attributes to assign.
+Before 1.2.0, PHP.unserialize() honoured that name: it looked the class up in
+the constant namespace, called .new on it and then called {attr}= for every
+attribute in the payload.  A value taken from a database column, a cookie or a
+request parameter could therefore choose which class in your process got
+instantiated and which setters ran.  Those side effects happen during
+unserialize(), so rescuing the return value does not undo them.
+
+Since 1.2.0 an object record is only built if the caller allows that class:
+
+ # Data only -- any 'O:' record raises PHP::UnserializeError.
+ # Use this for anything you did not serialize yourself.
+ PHP.unserialize_data(untrusted)
+
+ # Allow specific classes, by their capitalized PHP name.
+ PHP.unserialize(str, {:Teststruct => TestStruct})
+
+ # Attributes as a plain Hash, instantiating nothing.
+ PHP.unserialize(str, :on_object => :data)
+
+ # Pre-1.2.0 constant lookup.  Only for input you produced yourself.
+ PHP.unserialize(str, :on_object => :constants)
+
+Nesting is bounded at PHP::MAX_DEPTH (512 by default, :max_depth per call),
+because SystemStackError would escape the caller's rescue.
+
+The default is the strict mode: an unknown class raises
+PHP::UnserializeError (a TypeError subclass).  Attribute names must be plain
+identifiers and must resolve to a public writer on the target, so PHP's
+mangled private property names ("\0Class\0prop") are rejected rather than
+sent.  Malformed or truncated input raises PHP::UnserializeError too, instead
+of silently returning a partial value.
+
+
 Acknowledgements
 ================
 
